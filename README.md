@@ -15,7 +15,7 @@ The receiver has 2 parts:
 
 Arduino does the minimum RF processing. Since the cheap 433MHz receiver signal levels aren't enough for the digital pins, the data output is connected to an analog input pin. After some tuning for signal level(cutoff between 1 and 0) the Arduino sketch sends over serial the time duration and signal level.
 
-Example output is in [signal.dat](../blob/master/signal.dat)
+Example output is in [signal.dat](../master/signal.dat)
 
 ## PC Software
 
@@ -26,4 +26,4 @@ Consider a time unit to be around 370ms(TU).
 
 The 24bit value is repeated a few times.
 
-Checkout [rcsend.cpp](../blob/master/rcsend.cpp) for a transmitter example that emulates the remote control.
+Checkout [rcsend.cpp](../master/rcsend.cpp) for a transmitter example that emulates the remote control.
