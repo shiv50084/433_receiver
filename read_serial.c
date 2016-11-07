@@ -33,34 +33,40 @@
 #define		BUFFER_LEN		4
 #define		NUM_THREADS		2
 #define		BIG_BUF			(3 * 4096)
+#define         LINE_SEP                "\r\n"
 
 pthread_t		threads[NUM_THREADS];
 pthread_mutex_t		init_mutex = PTHREAD_MUTEX_INITIALIZER;
+pthread_rwlock_t        signal_lock = PTHREAD_RWLOCK_INITIALIZER;
 char			infilename[PATH_MAX];
 char 			*big_buf;
 
+pthread_mutex_t signal_mutex;
+pthread_cond_t signal_threshold_cv;
+
 unsigned int ids[100][2] = {0};
 unsigned int last_id = 0;
+int last_signal = -1;
 
 /* CO/TECH remote */
-unsigned long signalRA1 = 0b101000010111010010101100;
-unsigned long signalRA0 = 0b101010101111011110111100;
+#define SIGNAL_RA1      0b101000010111010010101100
+#define SIGNAL_RA0      0b101010101111011110111100
 
-unsigned long signalRB1 = 0b101001110101001011110101;
-unsigned long signalRB0 = 0b101001000100010111010101;
+unsigned int signalRB1 = 0b101001110101001011110101;
+unsigned int signalRB0 = 0b101001000100010111010101;
 
-unsigned long signalRC1 = 0b101011000000111110001110;
-unsigned long signalRC0 = 0b101010111001110101101110;
+unsigned int signalRC1 = 0b101011000000111110001110;
+unsigned int signalRC0 = 0b101010111001110101101110;
 
-unsigned long signalRD1 = 0b101001000100010111010111;
-unsigned long signalRD0 = 0b101001110101001011110111;
+unsigned int signalRD1 = 0b101001000100010111010111;
+unsigned int signalRD0 = 0b101001110101001011110111;
 
 
 unsigned long signals[] = {
         // A1
-        0b101000010111010010101100,
+        SIGNAL_RA1,
         // A0
-        0b101010101111011110111100,
+        SIGNAL_RA0,
         // unsigned long signalRB1
         0b101001110101001011110101,
         // unsigned long signalRB0
@@ -86,6 +92,7 @@ static void int_handler(int not_used)
 void add_id(unsigned int id)
 {
     int found_id = -1;
+    /* Check if the signal exists in the list of known signals */
     for (int i = 0; i < sizeof(signals) / sizeof(unsigned long); i++) {
         if (signals[i] == id) {
             found_id = i;
@@ -94,16 +101,28 @@ void add_id(unsigned int id)
     }
     if (found_id == -1)
         return;
+    /* If it was seen already in this sequence then +1 */
     for (int i = 0; i < last_id; i++)
         if(ids[i][0] == id) {
             ids[i][1]++;
             return;
         }
+    /* First time seen signal in this sequence */
     last_id++;
     ids[last_id + 1][0] = id;
     ids[last_id + 1][1] = 1;
 }
 
+/*
+ * Main decode sequence. Takes the input data from big_buf, splits
+ * it in lines and for every 2 lines it decodes:
+ * if the high signal lasts longer than the low signal then a "1" was encoded
+ * if the low signal lasts longer than the high signal then a "0" was encoded
+ * 
+ * TODO: there are sync signals for sure that are not taken into account
+ * NOTE: the sequence must start with a 1
+ * NOTE: long press on remote control will generate repeating values
+ */
 int decode_data()
 {
     unsigned long time1, time2;
@@ -117,9 +136,9 @@ int decode_data()
     memset(ids, 0, sizeof(ids));
     last_id = 0;
     printf("Processing: %s\n", big_buf);
-    line1 = strtok(buf, "\r\n");
+    line1 = strtok(buf, LINE_SEP);
     while (line1) {
-	line2 = strtok(NULL, "\r\n");
+	line2 = strtok(NULL, LINE_SEP);
         if (!line2) {
             printf("\nNo even lines left!\n");
             break;
@@ -137,26 +156,29 @@ int decode_data()
                 id = 0;
                 printf("\n");
                 l += 2;
-               	line1 = strtok(NULL, "\r\n");
+               	line1 = strtok(NULL, LINE_SEP);
                 continue;
             }
             //printf("Got %lu usecs for level %u\n", time1, level1);
+            id <<= 1;
             if (time1 > time2) {
                 printf("1");
-                id = (id << 1) + 1;
+                id += 1;
             }
             else {
                 printf("0");
-                id = id << 1;
             }
             b++;
+            /* We expect 24 bits of data, when found then
+             * start from the beggning */
             if (b == 24) {
                 b = 0;
                 printf(" %08X\n", id);
                 add_id(id);
                 printf("24 bits at %u\n", l + 2);
+                /* Skip sync signals, one high, one low */
                 for (int i = 0; i < 2; i++) {
-		    line1 = strtok(NULL, "\r\n");
+		    line1 = strtok(NULL, LINE_SEP);
                     l++;
                 }
                 id = 0;
@@ -164,13 +186,15 @@ int decode_data()
             }
         }
         l += 2;
-	line1 = strtok(NULL, "\r\n");
+	line1 = strtok(NULL, LINE_SEP);
     }
     free(buf);
+    /* Nothing was found, no know signal was decoded */
     if(!last_id)
         return -1;
+    /* Find the signal with the highest appearance rate */
     int max_id = 0;
-    for(int i = 0; i < last_id; i++) {
+    for(int i = 1; i < last_id; i++) {
         if (ids[i][1] > ids[max_id][1]) {
             max_id = i;
         }
@@ -230,7 +254,7 @@ set_blocking (int fd, int should_block)
                 return;
         }
 	/* Break buffer into lines */
-	//tty.c_lflag |= ICANON;
+	tty.c_lflag |= ICANON;
         tty.c_cc[VMIN]  = should_block ? 1 : 0;
         tty.c_cc[VTIME] = 0;            // 0.5 seconds read timeout
 
@@ -263,191 +287,68 @@ void *read_data(void/*jack_ringbuffer_t *rb*/)
 		int n = 0;
 		char buf[100] = {0};
 		if (start) {
-			/* Wait 5000 miliseconds for an POLLIN event on STDIN. */
+			/* Wait 1000 miliseconds for an POLLIN event on STDIN. */
 			pfd.fd = fd;
 			pfd.events = POLLIN;
 			rv = poll(&pfd, 1, 1000);
-#if 0
-			timeout.tv_sec = 2;
-			timeout.tv_usec = 0;
-			rv = select(fd + 1, &set, NULL, NULL, &timeout);
-#endif
 			if(rv == -1) {
 				perror("select"); /* an error accured */
-				return NULL;
+				exit(1);
 			} else if(rv == 0) {
 				printf("timeout\n"); /* a timeout occured */
-				printf("FINAL ID: %06X\n", decode_data());
+                                last_signal = decode_data();
+                                pthread_cond_signal(&signal_threshold_cv);
 				start = 0;
 				continue;
 			}
 			else {
-				//set_blocking (fd, 0);                // set non blocking
 				n = read(fd, buf, sizeof(buf) ); /* there was data to read */
 			}
 		}
 		else {
-			//set_blocking (fd, 1);                // set blocking
 			big_buf[0] = 0;
 			memset(big_buf, 0, BIG_BUF);
+                        pthread_mutex_unlock(&signal_mutex);
 			n = read(fd, buf, sizeof(buf)); /* there was data to read */
+                        pthread_mutex_lock(&signal_mutex);
+                        last_signal = -1;
 			start = 1;
 			printf("New data\n");
 		}
 		strncat(big_buf, buf, n);
-		printf("GOT %d bytes: \n%s\n", n, buf);
+		//printf("GOT %d bytes: \n%s\n", n, buf);
 	}
-#if 0
-	SNDFILE				*infile;
-	SF_INFO				sfinfo;
-	int					readcount, rb_readcount;
-	snd_pcm_format_t	pcm_format;
-	int					m;
-	codec_filter_t		filter;
-	
-	char	*tmp,*filter_buff;
-	uint32_t *pt;
-	int		*buffer;
-	int		ret, res;
-	int		buf_size, i, j, neg;
-	int		format;
-	
-	if ( !(infile = sf_open(infilename, SFM_READ, &sfinfo) ) )
-	{
-		/* Open failed so print an error message. */
-		LOG_ERROR("Not able to open input file %s!", infilename ) ;
-		/* Print the error message from libsndfile. */
-		LOG_ERROR(sf_strerror(NULL));
-		pthread_cancel(threads[1]);
-		pthread_exit(NULL);
-	}
-
-	if ( sfinfo.channels > MAX_CHANNELS )
-	{
-		LOG_ERROR("Found %d channels, not able to process more than %d channels",
-			 sfinfo.channels, MAX_CHANNELS ) ;
-		pthread_cancel(threads[1]);
-		pthread_exit(NULL);
-	}
-	
-	if( channel >= sfinfo.channels)
-	{
-		LOG_ERROR("Invalid channel selected, wanted %d but %d are available",
-				  channel + 1, sfinfo.channels);
-		pthread_cancel(threads[1]);
-		pthread_exit(NULL);
-	}
-
-	format = sfinfo.format & 0xFF;
-	if(format == SF_FORMAT_PCM_16){
-		pcm_format = SND_PCM_FORMAT_S16_LE;
-		m = 2;
-		filter = codec_l16_filter;
-	}
-	else if(format == SF_FORMAT_PCM_24 ||
-		format == SF_FORMAT_PCM_32){
-		pcm_format = SND_PCM_FORMAT_S32_LE;
-		m = 4;
-		filter = codec_l32_filter;
-	}
-	else{
-		LOG_ERROR("Invalid PCM format in payload!");
-		pthread_cancel(threads[1]);
-		pthread_exit(NULL);
-	}
-
-	if( !(snd_buf_size = snd_set_params(snd_handle, &snd_frames_no,
-		pcm_format, sfinfo.samplerate, 2)) ){
-		LOG_ERROR("Failed to set hw parameters!");
-		pthread_cancel(threads[1]);
-		pthread_exit(NULL);
-	}
-	if(pthread_mutex_unlock(&init_mutex) < 0){
-		LOG_ERROR("Failed to unlock mutex!");
-		pthread_cancel(threads[1]);
-		pthread_exit(NULL);
-	}
-
-	buf_size = 2048;
-	buffer = malloc(buf_size * sizeof(int));
-	tmp = malloc(m * buf_size);
-	filter_buff = malloc(buf_size * sizeof(int));
-
-restart:
-	while ( (readcount = sf_read_int(infile, buffer, buf_size))>0 )
-	{
-		pthread_testcancel();
-		pt = tmp;
-
-		for(i = 0; i < readcount; i++){
-			res = buffer[i];
-			*pt = widi_fec_encode(res >> 8);
-			pt++;
-		}
-
-		j = filter(tmp, readcount * m, sfinfo.channels, channel, filter_buff);
-		pt = filter_buff;
-		widi_fec_decode_buf(pt, j);
-		while( (ret = jack_ringbuffer_write(rb, pt, j)) != j){
-			if(ret == -1)
-				break;
-			else if(ret != j){
-				j -= ret;
-				pt += ret;
-			}
-		}
-	}
-	printf("thread finished\n");
-	free(filter_buff);
-	free(buffer);
-	free(tmp);
-	sf_close(infile);
-#endif
 	pthread_exit(NULL);
 }
 
 void *play_data(void/*jack_ringbuffer_t *rb*/)
 {
-#if 0
-	uint8_t	*buffer;
 	int	rc;
-	size_t	readcount;
+        int     signal = -1;
 	
-	if(pthread_mutex_lock(&init_mutex) < 0){
-		LOG_ERROR("Failed to lock mutex!");
+	/*if(pthread_mutex_lock(&init_mutex) < 0){
+		fprintf(stderr, "Failed to lock mutex!");
 		exit(1);
-	}
-
-	/* don't start until the stream is setup correctly */
-	if(snd_pcm_state(snd_handle) != SND_PCM_STATE_PREPARED || !snd_buf_size){
-		LOG_ERROR("Initialization failed, cannot play sound file!");
-		exit(1);
-	}
-
-	buffer = malloc(snd_buf_size);
-	while ( (readcount = jack_ringbuffer_read(rb, buffer, snd_buf_size)) == readcount)
-	{
-		pthread_testcancel();
-		if(readcount != snd_buf_size){
-			LOG_ERROR("readcount(%u) != snd_buf_size(%u)", readcount,
-				  snd_buf_size);
-			break;
-		}
-
-		rc = snd_pcm_writei(snd_handle, buffer, snd_frames_no);
-		if (rc == -EPIPE) {
-			/* EPIPE means underrun */
-			LOG_WARNING("underrun occurred");
-			snd_pcm_prepare(snd_handle);
-		} else if (rc < 0) {
-			LOG_ERROR("error from writei: %s", snd_strerror(rc));
-			break;
-		}  else if (rc != (int)snd_frames_no) {
-			LOG_WARNING("short write, write %d frames", rc);
-		}
-	}
-	free(buffer);
-#endif
+	}*/
+	
+        pthread_mutex_lock(&signal_mutex);
+        while (1) {
+            pthread_cond_wait(&signal_threshold_cv, &signal_mutex);
+            printf("Received SIGNAL: %06X\n", last_signal);
+            switch(last_signal) {
+                case SIGNAL_RA0:
+                    printf("ALL OFF\n");
+                    system("./lights_off.sh");
+                    break;
+                case SIGNAL_RA1:
+                    printf("ALL ON\n");
+                    system("./lights_on.sh");
+                    break;
+                default:
+                    printf("Nothing\n");
+            }
+        }
+        pthread_mutex_unlock(&signal_mutex);
 	pthread_exit(NULL);
 }
 
@@ -486,6 +387,9 @@ int main(int argc, char **argv)
 		fprintf(stderr, "failed to init mutex\n");
 		exit(1);
 	}
+        pthread_mutex_init(&signal_mutex, NULL);
+        pthread_cond_init (&signal_threshold_cv, NULL);
+
 	for(t=0; t < NUM_THREADS; t++){
 		fprintf(stdout, "creating thread %d\n", t);
 		rc = pthread_create(&threads[t], NULL, func[t], NULL/*(void *)rb*/);
@@ -498,6 +402,9 @@ int main(int argc, char **argv)
 	
 	pthread_join(threads[0], (void *) &rc);
 	pthread_cancel(threads[1]);
+        
+        pthread_mutex_destroy(&signal_mutex);
+        pthread_cond_destroy(&signal_threshold_cv);
 
 	return 0 ;
 }
