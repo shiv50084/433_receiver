@@ -27,3 +27,8 @@ Consider a time unit to be around 370ms(TU).
 The 24bit value is repeated a few times.
 
 Checkout [rcsend.cpp](../master/rcsend.cpp) for a transmitter example that emulates the remote control.
+
+
+## References
+
+[NinjaBlocks 433Utils project](https://github.com/ninjablocks/433Utils)
