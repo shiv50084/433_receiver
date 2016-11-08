@@ -22,6 +22,7 @@
 #include	<stdlib.h>
 #include	<signal.h>
 #include	<limits.h>
+#include        <sys/select.h>
 #include	<pthread.h>
 #include	<errno.h>
 #include	<fcntl.h> 
@@ -37,8 +38,7 @@
 
 pthread_t		threads[NUM_THREADS];
 pthread_mutex_t		init_mutex = PTHREAD_MUTEX_INITIALIZER;
-pthread_rwlock_t        signal_lock = PTHREAD_RWLOCK_INITIALIZER;
-char			infilename[PATH_MAX];
+char			infilename[4096];
 char 			*big_buf;
 
 pthread_mutex_t signal_mutex;
@@ -132,7 +132,7 @@ int decode_data()
     unsigned int l = 0, b = 0;
     char *line1 = NULL, *line2 = NULL;
     size_t len = 0;
-    char *buf = strdup(big_buf);
+    char *buf = strdup((const char *)big_buf);
     memset(ids, 0, sizeof(ids));
     last_id = 0;
     printf("Processing: %s\n", big_buf);
@@ -233,7 +233,7 @@ set_interface_attribs (int fd, int speed, int parity)
         tty.c_cflag &= ~(PARENB | PARODD);      // shut off parity
         tty.c_cflag |= parity;
         tty.c_cflag &= ~CSTOPB;
-        tty.c_cflag &= ~CRTSCTS;
+        //tty.c_cflag &= ~CRTSCTS;
 
         if (tcsetattr (fd, TCSANOW, &tty) != 0)
         {
