@@ -33,15 +33,15 @@
 
 #define		BUFFER_LEN		4
 #define		NUM_THREADS		2
-#define		BIG_BUF			(3 * 4096)
+#define		BIG_BUF			(4096 * 4096)
 #define         LINE_SEP                "\r\n"
 
 pthread_t		threads[NUM_THREADS];
 pthread_mutex_t		init_mutex = PTHREAD_MUTEX_INITIALIZER;
 char			infilename[4096];
 char 			*big_buf;
-
-pthread_mutex_t signal_mutex;
+char                    *decode_buf;
+pthread_mutex_t signal_mutex;   
 pthread_cond_t signal_threshold_cv;
 
 unsigned int ids[100][2] = {0};
@@ -123,40 +123,51 @@ void add_id(unsigned int id)
  * NOTE: the sequence must start with a 1
  * NOTE: long press on remote control will generate repeating values
  */
-int decode_data()
+int decode_data_inner(char *big_buf)
 {
     unsigned long time1, time2;
-    unsigned int level1, level2;
+    unsigned int level1, level2, ml1, ml2;
     unsigned int id = 0;
     ssize_t read;
     unsigned int l = 0, b = 0;
     char *line1 = NULL, *line2 = NULL;
     size_t len = 0;
-    char *buf = strdup((const char *)big_buf);
     memset(ids, 0, sizeof(ids));
     last_id = 0;
     printf("Processing: %s\n", big_buf);
-    line1 = strtok(buf, LINE_SEP);
+    memset(decode_buf, 0, BIG_BUF);
+    line1 = strtok(big_buf, LINE_SEP);
+    printf("Line len:%d\n", strlen(line1));
+    strcat(decode_buf, line1);
+    strcat(decode_buf,"\n");
     while (line1) {
+        strcat(decode_buf, line1);
+        strcat(decode_buf,"\n");
+
 	line2 = strtok(NULL, LINE_SEP);
         if (!line2) {
             printf("\nNo even lines left!\n");
+            memset(decode_buf, 0, BIG_BUF);
             break;
         }
+        strcat(decode_buf, line2);
+        strcat(decode_buf,"\n");
         if (sscanf(line1, "%lu %u", &time1, &level1) != EOF &&
             sscanf(line2, "%lu %u", &time2, &level2) != EOF) {
             if (level1 == level2) {
                 printf("\nWrong level sequence at line %u!\n", l);
                 printf("\n%s\n%s\n", line1, line2);
+                memset(decode_buf, 0, BIG_BUF);
                 break;
             }
-            
             if (time2 > 2000) {
                 b = 0;
                 id = 0;
                 printf("\n");
                 l += 2;
                	line1 = strtok(NULL, LINE_SEP);
+                strcat(decode_buf, line1);
+                strcat(decode_buf,"\n");
                 continue;
             }
             //printf("Got %lu usecs for level %u\n", time1, level1);
@@ -174,6 +185,8 @@ int decode_data()
             if (b == 24) {
                 b = 0;
                 printf(" %08X\n", id);
+                printf("Decoded from:\n%s\n", decode_buf);
+                memset(decode_buf, 0, BIG_BUF);
                 add_id(id);
                 printf("24 bits at %u\n", l + 2);
                 /* Skip sync signals, one high, one low */
@@ -188,7 +201,7 @@ int decode_data()
         l += 2;
 	line1 = strtok(NULL, LINE_SEP);
     }
-    free(buf);
+    //free(buf);
     /* Nothing was found, no know signal was decoded */
     if(!last_id)
         return -1;
@@ -200,6 +213,26 @@ int decode_data()
         }
     }
     return ids[max_id][0];
+}
+
+int decode_data()
+{
+    int i, ret = -1;
+    char *buf = malloc(strlen(big_buf + 1));
+    strcpy(buf, big_buf);
+    ret = decode_data_inner(buf);
+    if (ret >= 0)
+        return ret;
+    for (i = 0; i < strlen(big_buf) - 1 || i < 150;i++) {
+        if (big_buf[i] == '\r' && big_buf[i+1] == '\n')
+            if (i + 2 < strlen(big_buf)) {
+                strcpy(buf, big_buf);
+                ret = decode_data_inner(buf + i + 2);
+                if (ret >= 0)
+                    return ret;
+            }
+    }
+    return -1;
 }
 
 int
@@ -276,7 +309,7 @@ void *read_data(void/*jack_ringbuffer_t *rb*/)
 		return NULL;
 	}
 
-	set_interface_attribs (fd, B115200, 0);  // set speed to 115,200 bps, 8n1 (no parity)
+	set_interface_attribs (fd, B921600, 0);  // set speed to 115,200 bps, 8n1 (no parity)
 	set_blocking (fd, 1);                // set blocking
 
  	FD_ZERO(&set); /* clear the set */
@@ -373,7 +406,10 @@ int main(int argc, char **argv)
 	}
 	else{
 		strcpy(infilename, "/dev/ttyACM0");
-	}	
+	}
+	
+	decode_buf = malloc(BIG_BUF);
+	memset(decode_buf, 0, BIG_BUF);
 
 	fprintf(stdout, "Playing %s\n", infilename);
 	big_buf = malloc(BIG_BUF);
